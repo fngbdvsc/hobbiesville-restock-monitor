@@ -445,6 +445,30 @@ class TestCollectionScan(unittest.TestCase):
         self.assertIn("Found 1", reply)
         self.assertIn("No product", mon.command("!find charizard"))
 
+    def test_wrong_store_warns_and_marks_alerts(self):
+        s = FakeSession([(200, js_product(True), None)])
+        s.currency = "USD"
+        errors = []
+
+        async def send_error(t):
+            errors.append(t)
+        mon, alerts, texts, _ = make_monitor(s, send_error=send_error)
+        mon.watch = [HANDLE]
+
+        async def go():
+            for _ in range(3):
+                await mon.tick()
+            await asyncio.sleep(0)
+        run(go())
+        self.assertIn("showing me its USD store", texts[-1])
+        self.assertEqual(sum("USD store" in t for t in texts), 1)     # said once, not every check
+        self.assertIn("may be different on the CA store", alerts[0]["why"])
+        self.assertIn("WRONG", mon.command("!status"))
+        s.currency = "CAD"
+        run(mon.check_region())
+        self.assertIn("CA store again", texts[-1])
+        self.assertNotIn("WRONG", mon.command("!status"))
+
     def test_saved_memory_means_no_learning_scan(self):
         s = FakeSession([coll_page([coll_product("etb", True)])])
         mon, alerts, _, _ = make_monitor(s)

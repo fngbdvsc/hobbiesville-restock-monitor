@@ -88,6 +88,11 @@ FETCHER = os.environ.get("FETCHER", "browser").strip().lower()
 # Without a screen (e.g. on a Mac test), it falls back to hidden.
 HEADLESS = os.environ.get("HEADLESS", "1") != "0" or not os.environ.get("DISPLAY")
 
+# Railway's IP is in the US, so Hobbiesville shows its US store (USD, and Canada-only products "don't exist").
+# The browser picks this country in the store's own country picker, then checks the currency is right.
+STORE_COUNTRY = os.environ.get("STORE_COUNTRY", "CA").strip().upper()
+STORE_CURRENCY = os.environ.get("STORE_CURRENCY", "CAD").strip().upper()
+
 # The light mode's honest name. It doesn't pretend to be a browser.
 USER_AGENT = "PokeCA-restock-monitor/1.0 (personal restock alerts, one request every 8-15 seconds)"
 
@@ -478,6 +483,27 @@ FETCH_JS = """async (u) => {
   return [r.status, await r.text(), r.url];
 }"""
 
+# Pick the store's country the same way its country picker does (a Shopify "localization" form), then ask the
+# store's own cart which currency it is using. Returns [currency before, currency after, country the page showed].
+REGION_JS = """async ([country, currency]) => {
+  const cur = async () => {
+    try {
+      const r = await fetch("/cart.js", {credentials: "same-origin", headers: {"Accept": "application/json"}});
+      return (await r.json()).currency || null;
+    } catch (e) { return null; }
+  };
+  const shown = (window.Shopify && window.Shopify.country) || null;
+  const before = await cur();
+  let after = before;
+  if (before !== currency || (shown && shown !== country)) {
+    const body = new URLSearchParams({form_type: "localization", utf8: "\\u2713", _method: "put",
+                                      country_code: country, return_to: "/"});
+    try { await fetch("/localization", {method: "POST", body: body, credentials: "same-origin"}); } catch (e) {}
+    after = await cur();
+  }
+  return [before, after, shown];
+}"""
+
 
 class BrowserSession:
     """A real Chrome (normal window on Railway's virtual screen). It opens the Hobbiesville homepage like a
@@ -494,6 +520,7 @@ class BrowserSession:
         self._closing = False
         self._requests = 0
         self._since_home = None   # None = the tab isn't on Hobbiesville yet
+        self.currency = None      # the currency Hobbiesville's cart reported last (CAD = the Canadian store)
         self._lock = asyncio.Lock()
 
     async def _cookies(self):
@@ -567,6 +594,7 @@ class BrowserSession:
                     if looks_like_check(status, html):
                         self._since_home = None
                         return PageResult(html, status, self._page.url)   # the homepage itself was refused
+                    await self._pick_country()
                     await self._page.wait_for_timeout(random.uniform(500, 1500))
                 status, text, final = await self._page.evaluate(FETCH_JS, url)
                 self._since_home += 1
@@ -577,6 +605,17 @@ class BrowserSession:
             finally:
                 self._requests += 1
             return PageResult(text, status, final)
+
+    async def _pick_country(self):
+        try:
+            before, after, shown = await self._page.evaluate(REGION_JS, [STORE_COUNTRY, STORE_CURRENCY])
+        except Exception as e:
+            print(f"[browser] couldn't check the store's country: {type(e).__name__}: {str(e)[:200]}")
+            return
+        if before != after:
+            print(f"[browser] Hobbiesville showed the {before or '?'} store (country {shown or '?'}); "
+                  f"picked {STORE_COUNTRY} in its country picker, now {after or '?'}")
+        self.currency = after
 
     async def post_json(self, url, headers, body):
         raise RuntimeError("the browser session is only for Hobbiesville")
@@ -698,6 +737,7 @@ class Monitor:
         self.baselined = set()     # (collection, page) pages read at least once since start
         self.scan_counts = {}      # collection -> products seen on its last full scan
         self._noted = set()
+        self.last_currency = None
         self.send_alert = send_alert
         self.send_text = send_text
         self.send_error = send_error
@@ -779,7 +819,32 @@ class Monitor:
                 print(f"[discord] couldn't send message: {e}")
         self.dash_log(kind, text, sku)
 
+    def store_seen(self):
+        """The currency Hobbiesville's cart reported (None = not known, e.g. light mode)."""
+        return getattr(self.session, "currency", None)
+
+    async def check_region(self):
+        cur = self.store_seen()
+        if not cur or cur == self.last_currency:
+            return
+        prev, self.last_currency = self.last_currency, cur
+        if cur == STORE_CURRENCY:
+            if prev:
+                await self._say(f"Hobbiesville is showing me the {STORE_COUNTRY} store again (prices in {cur}).")
+            return
+        msg = (f"Hobbiesville is showing me its {cur} store, not the {STORE_COUNTRY} one, even after I picked "
+               f"{STORE_COUNTRY} in its country picker. Products only sold in {STORE_COUNTRY} will look like "
+               f"they don't exist, and prices are in {cur}. A {STORE_COUNTRY} proxy (PROXY variable) or running "
+               f"the bot from your Mac would fix this.")
+        print(f"[region] {msg}")
+        self.dash_error("region", msg)
+        await self._say(msg, kind="error")
+
     async def _alert(self, alert):
+        cur = self.store_seen()
+        if cur and cur != STORE_CURRENCY:
+            alert["why"] += (f" Note: Hobbiesville showed me its {cur} store, so this may be different on "
+                             f"the {STORE_COUNTRY} store.")
         try:
             await self.send_alert(alert)
         except Exception as e:
@@ -872,6 +937,7 @@ class Monitor:
             else:
                 await self.check(job[1], confirm=job[2])
             self.good_pages += 1
+            await self.check_region()
             if self.was_blocked:
                 self.was_blocked = False
                 self.backoff = BACKOFF_START
@@ -1241,6 +1307,8 @@ class Monitor:
             return (f"Status: {state}\nWatching {len(self.watch)} product(s), checked about every "
                     f"{self.round_estimate()}s (requests spaced {GAP_MIN}-{GAP_MAX}s apart).\n"
                     f"Collection scan: {scan}.\n"
+                    f"Store I'm seeing: {self.store_seen() or 'not known yet'}"
+                    f"{'' if self.store_seen() in (None, STORE_CURRENCY) else ' (WRONG: should be ' + STORE_CURRENCY + ')'}.\n"
                     f"Method: {'real Chrome' if FETCHER != 'light' else 'light (plain web requests, no browser)'}.\n"
                     f"Requests made since start: {self.requests_made}. Last request {since}s ago.\n"
                     f"Queued extra checks: {len(self.priority)}.")
