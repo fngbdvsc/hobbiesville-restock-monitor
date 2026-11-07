@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+hobbiesville_state.json
+hobbiesville_config.json
+debug_*
