@@ -179,6 +179,15 @@ class TestClassify(unittest.TestCase):
         self.assertIn("Just a moment", detail)
         self.assertEqual(hm.classify_response(200, CLOUDFLARE, URL + ".js")[0], "blocked")
 
+    def test_normal_page_with_cloudflare_scripts_is_not_a_check(self):
+        home = ("<html><head><title>Hobbiesville</title>"
+                "<script src='/cdn-cgi/challenge-platform/scripts/jsd/main.js'></script>"
+                "<script src='https://www.google.com/recaptcha/api.js'></script></head>"
+                "<body>Canada's Premier Hobby Shop</body></html>")
+        self.assertFalse(hm.looks_like_check(200, home))
+        self.assertTrue(hm.looks_like_check(200, CLOUDFLARE))
+        self.assertTrue(hm.looks_like_check(429, ""))
+
     def test_password_page(self):
         self.assertEqual(hm.classify_response(200, STORE_PAGE, "https://hobbiesville.com/password")[0], "password")
 

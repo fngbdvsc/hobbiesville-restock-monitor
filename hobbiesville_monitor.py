@@ -1,9 +1,9 @@
 """
 Hobbiesville monitor for Discord. A separate bot from the Walmart and Amazon ones (own repo, own Railway project).
 
-LIGHT version: no Chrome, no Playwright, no virtual screen. Hobbiesville runs on Shopify, and every Shopify
+Hobbiesville runs on Shopify. Plain web requests were refused from Railway (HTTP 429), so by default the bot
+opens the homepage in a real Chrome and reads the public product data from there. Every Shopify
 product page has its data at <product link>.js (name, price, and whether each option can be bought).
-The bot reads that with plain web requests, so it needs very little memory.
 
 - Every request to Hobbiesville is spaced 8-15 seconds apart (random).
 - An alert posts once when a watched product comes into stock, and re-arms when it sells out.
@@ -81,7 +81,14 @@ CONFIG_FILE = os.path.join(DATA_DIR, "hobbiesville_config.json")
 BASE = "https://www.hobbiesville.com"
 HOSTS = ("hobbiesville.com", "www.hobbiesville.com")
 
-# An honest name for this bot. It doesn't pretend to be a browser.
+# "browser" (default) = a real Chrome, because Hobbiesville refused plain requests from Railway (HTTP 429).
+# "light" = plain web requests, no browser (much less memory, but refused from Railway's IP).
+FETCHER = os.environ.get("FETCHER", "browser").strip().lower()
+# On Railway, Chrome runs as a normal window on a virtual screen (HEADLESS=0 + DISPLAY from the Dockerfile).
+# Without a screen (e.g. on a Mac test), it falls back to hidden.
+HEADLESS = os.environ.get("HEADLESS", "1") != "0" or not os.environ.get("DISPLAY")
+
+# The light mode's honest name. It doesn't pretend to be a browser.
 USER_AGENT = "PokeCA-restock-monitor/1.0 (personal restock alerts, one request every 8-15 seconds)"
 
 # With the dashboard connected, status messages go only to the dashboard and Discord gets only alerts.
@@ -298,7 +305,7 @@ def page_excerpt(text, n=160):
     return " ".join(htmllib.unescape(t).split())[:n]
 
 
-CHALLENGE_MARKERS = ("cf-chl", "challenge-platform", "just a moment", "attention required",
+CHALLENGE_MARKERS = ("just a moment", "attention required", "checking your browser",
                      "verify you are human", "are you a robot", "captcha", "access denied",
                      "too many requests")
 
@@ -338,10 +345,18 @@ def classify_collection(status, text, final_url=""):
     return _refusal(status, text, final_url, "/collections/")
 
 
+def looks_like_check(status, text):
+    """A bot-check / refusal page. Judged on the title and visible words, not scripts: normal Shopify pages
+    can load Cloudflare or captcha scripts too."""
+    if status in (403, 429, 503):
+        return True
+    seen = (page_title(text) + " " + page_excerpt(text, 600)).lower()
+    return "cf-chl" in (text or "").lower() or any(m in seen for m in CHALLENGE_MARKERS)
+
+
 def _refusal(status, text, final_url, expected_path):
     path = urlsplit(final_url or "").path.lower()
-    low = (text or "").lower()
-    if status in (403, 503) or any(m in low for m in CHALLENGE_MARKERS):
+    if looks_like_check(status, text):
         return "blocked", (f'HTTP {status}, page title "{page_title(text)}", '
                            f'page says: "{page_excerpt(text)}"')
     detail = f"HTTP {status}"
@@ -447,8 +462,164 @@ class HttpSession:
         await self.close()
 
 
+def browser_proxy(proxy):
+    if not proxy:
+        return None
+    u = urlsplit(proxy)
+    out = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+    if u.username:
+        out["username"] = unquote(u.username)
+        out["password"] = unquote(u.password or "")
+    return out
+
+
+FETCH_JS = """async (u) => {
+  const r = await fetch(u, {credentials: "same-origin", headers: {"Accept": "application/json"}});
+  return [r.status, await r.text(), r.url];
+}"""
+
+
+class BrowserSession:
+    """A real Chrome (normal window on Railway's virtual screen). It opens the Hobbiesville homepage like a
+    visitor, then reads the same public product data the store's own pages load (<product>.js and
+    /collections/<name>/products.json) from inside that page. Same get() shape as HttpSession."""
+
+    RECYCLE_REQUESTS = 120    # restart Chrome (keeping cookies) this often so its memory doesn't keep growing
+    HOME_EVERY = 25           # open the homepage again every this many data requests
+
+    def __init__(self, proxy=None):
+        self.proxy = proxy
+        self._pw = self._browser = self._ctx = self._page = None
+        self._crashed = False
+        self._closing = False
+        self._requests = 0
+        self._since_home = None   # None = the tab isn't on Hobbiesville yet
+        self._lock = asyncio.Lock()
+
+    async def _cookies(self):
+        try:
+            if self._ctx is not None and self._browser.is_connected():
+                return await self._ctx.storage_state()
+        except Exception:
+            pass
+        return None
+
+    async def _restart(self, why):
+        state = await self._cookies()
+        print(f"[browser] restarting Chrome ({why}){', keeping cookies' if state else ''}")
+        await self.close()
+        await self._start(state)
+
+    def _alive(self):
+        return (self._page is not None and not self._crashed and not self._page.is_closed()
+                and self._browser.is_connected())
+
+    def _on_crash(self, _page):
+        self._crashed = True
+        print("[browser] the Hobbiesville tab crashed (usually means Chrome ran out of memory)")
+
+    async def _start(self, storage_state=None):
+        from playwright.async_api import async_playwright
+        self._pw = await async_playwright().start()
+        self._browser = await self._pw.chromium.launch(
+            headless=HEADLESS, proxy=browser_proxy(self.proxy),
+            # Memory savers only. Images off with a flag (keeps the browser cache working).
+            args=["--disable-dev-shm-usage", "--disable-extensions", "--blink-settings=imagesEnabled=false",
+                  "--renderer-process-limit=1", "--disable-site-isolation-trials",
+                  "--disable-features=site-per-process,IsolateOrigins,Translate,BackForwardCache,"
+                  "MediaRouter,OptimizationHints",
+                  "--disable-background-networking", "--disable-component-update", "--no-first-run"])
+        self._closing = False
+        self._browser.on("disconnected", lambda _b: None if self._closing else
+                         print("[browser] Chrome closed unexpectedly (often: Railway ran out of memory)"))
+        self._ctx = await self._browser.new_context(
+            locale="en-CA", timezone_id="America/Toronto", viewport={"width": 1366, "height": 768},
+            storage_state=storage_state)
+        self._page = await self._ctx.new_page()
+        self._page.on("crash", self._on_crash)
+        self._crashed = False
+        self._requests = 0
+        self._since_home = None
+
+    async def _open_home(self):
+        resp = await self._page.goto(f"{BASE}/", wait_until="domcontentloaded", timeout=40000)
+        await self._page.wait_for_timeout(random.uniform(2000, 4000))   # let the page finish loading
+        self._since_home = 0
+        return resp
+
+    async def get(self, url, headers=None):
+        async with self._lock:
+            if self._page is None:
+                await self._start()
+            elif not self._alive():
+                await self._restart("it crashed or closed")
+            elif self._requests >= self.RECYCLE_REQUESTS:
+                await self._restart("routine memory cleanup")
+            try:
+                if self._since_home is None or self._since_home >= self.HOME_EVERY:
+                    resp = await self._open_home()
+                    status = resp.status if resp else 0
+                    html = await self._page.content()
+                    if looks_like_check(status, html):
+                        self._since_home = None
+                        return PageResult(html, status, self._page.url)   # the homepage itself was refused
+                    await self._page.wait_for_timeout(random.uniform(500, 1500))
+                status, text, final = await self._page.evaluate(FETCH_JS, url)
+                self._since_home += 1
+            except Exception as e:
+                print(f"[browser] loading {url} failed: {type(e).__name__}: {str(e)[:300]}")
+                self._since_home = None
+                raise                      # a dead Chrome is restarted on the next request
+            finally:
+                self._requests += 1
+            return PageResult(text, status, final)
+
+    async def post_json(self, url, headers, body):
+        raise RuntimeError("the browser session is only for Hobbiesville")
+
+    async def describe(self):
+        """Startup check through Chrome itself: version, window mode, and the IP Hobbiesville will see."""
+        async with self._lock:
+            if not self._alive():
+                await self.close()
+                await self._start()
+            try:
+                await self._page.goto("https://api.ipify.org", timeout=20000)
+                ip = (await self._page.inner_text("body")).strip()[:60]
+            except Exception as e:
+                ip = f"check failed ({type(e).__name__}: {str(e).splitlines()[0][:120]})"
+            self._since_home = None
+            mode = "hidden (headless)" if HEADLESS else "normal window on a virtual screen"
+            line = f"Chrome {self._browser.version}, {mode}. Chrome's own outbound IP: `{ip}`"
+            print(f"[browser] {line}")
+            return line
+
+    async def close(self):
+        self._closing = True
+        for obj in (self._ctx, self._browser):
+            if obj is not None:
+                try:
+                    await obj.close()
+                except Exception:
+                    pass
+        if self._pw is not None:
+            try:
+                await self._pw.stop()
+            except Exception:
+                pass
+        self._pw = self._browser = self._ctx = self._page = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        await self.close()
+
+
 def make_session(proxy=None):
-    return HttpSession(proxy)
+    if FETCHER == "light":
+        return HttpSession(proxy)
+    return BrowserSession(proxy)
 
 
 # ------------------------------------------------------------ dashboard link
@@ -1041,7 +1212,7 @@ class Monitor:
             return (f"Status: {state}\nWatching {len(self.watch)} product(s), checked about every "
                     f"{self.round_estimate()}s (requests spaced {GAP_MIN}-{GAP_MAX}s apart).\n"
                     f"Collection scan: {scan}.\n"
-                    f"Method: light (plain web requests, no browser).\n"
+                    f"Method: {'real Chrome' if FETCHER != 'light' else 'light (plain web requests, no browser)'}.\n"
                     f"Requests made since start: {self.requests_made}. Last request {since}s ago.\n"
                     f"Queued extra checks: {len(self.priority)}.")
 
@@ -1093,14 +1264,13 @@ async def debug_product(raw):
         return
     async with make_session(get_proxy()) as s:
         url = product_data_url(handle)
-        print(f"Loading {url} with plain web requests (no browser)...")
+        print(f"Loading {url} ({'plain web requests' if FETCHER == 'light' else 'real Chrome'})...")
         r = await s.get(url)
         print(f"  HTTP {r.status_code}, ended up on {r.url}")
         kind, val = classify_response(r.status_code, r.text, r.url)
         if kind == "blocked":
             print(f"  BLOCKED: {val}")
-            print("  Simple requests don't work right now. Wait 30-60 minutes and try again; if it keeps happening,"
-                  " the bot would need the Chrome setup from the other bots.")
+            print("  Hobbiesville refused this connection right now. Wait 30-60 minutes and try again.")
         else:
             print_verdict(kind, val)
         if kind != "ok":
@@ -1117,7 +1287,7 @@ async def debug_scan(raw):
         return
     async with make_session(get_proxy()) as s:
         url = collection_data_url(coll)
-        print(f"Loading {url} with plain web requests (no browser)...")
+        print(f"Loading {url} ({'plain web requests' if FETCHER == 'light' else 'real Chrome'})...")
         r = await s.get(url)
         print(f"  HTTP {r.status_code}, ended up on {r.url}")
         kind, val = classify_collection(r.status_code, r.text, r.url)
@@ -1193,9 +1363,16 @@ def run_bot():
                     proxy_line = f"Proxy: `{safe}`"
                 else:
                     proxy_line = "Proxy: **not set** (using Railway IP)"
+                if isinstance(self.mon.session, BrowserSession):
+                    try:
+                        method = "real Chrome browser\n" + await self.mon.session.describe()
+                    except Exception as e:
+                        method = f"real Chrome browser\nChrome failed to start: `{type(e).__name__}: {e}`"
+                else:
+                    method = "light (plain web requests, no browser). Delete the FETCHER variable to use Chrome."
                 await self.mon._say(
                     f"Hobbiesville bot online ({where}).\n{proxy_line}\n"
-                    f"Method: light (plain web requests to Shopify's product data, no browser).\n"
+                    f"Method: {method}\n"
                     f"Collection scan: {', '.join(self.mon.collections) or 'off'}.\n"
                     f"Alerts when a watched or scanned product comes into stock, or a new one is listed. "
                     f"Every request to Hobbiesville is "
