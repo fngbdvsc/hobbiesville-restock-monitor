@@ -184,6 +184,28 @@ def scan_collections(raw):
 SCAN_COLLECTIONS = scan_collections(SCAN_COLLECTIONS_RAW)
 
 
+# Short forms people use for Pokemon products, so !find understands them.
+FIND_ALIASES = {
+    "upc": "ultra premium collection", "spc": "super premium collection", "etb": "elite trainer box",
+    "pcetb": "pokemon center elite trainer box", "pc": "pokemon center", "bb": "booster box",
+    "bundle": "booster bundle", "tins": "tin", "boxes": "box", "packs": "pack", "pre": "pre order",
+    "preorder": "pre order",
+}
+
+
+def _words(s):
+    """Lowercase words only: 'Ultra-Premium Collection (Night)' -> 'ultra premium collection night'."""
+    return " ".join(re.split(r"[^a-z0-9]+", (s or "").lower())).strip()
+
+
+def _term_options(term):
+    """A search word matches itself, or its long form (upc -> ultra premium collection)."""
+    opts = [term]
+    if term in FIND_ALIASES:
+        opts.append(FIND_ALIASES[term])
+    return opts
+
+
 def product_url(handle):
     return f"{BASE}/products/{handle}"
 
@@ -1113,8 +1135,21 @@ class Monitor:
         return [h for _, h in sorted(scored)[:n]]
 
     def find(self, words):
-        words = [w.lower() for w in words]
-        return sorted((h, n) for h, n in self.names.items() if all(w in (h + " " + n).lower() for w in words))
+        """(matches, exact). exact=False means nothing had every word, so these are the closest ones."""
+        terms = [t for t in (_words(w) for w in words) if t]
+        if not terms:
+            return [], True
+        scored = []
+        for h, n in self.names.items():
+            text = " " + _words(h + " " + n) + " "
+            got = sum(1 for t in terms if any(f" {o}" in text for o in _term_options(t)))   # word starts
+            if got:
+                scored.append((-got, n.lower(), h, n))
+        scored.sort()
+        exact = [(h, n) for g, _, h, n in scored if -g == len(terms)]
+        if exact:
+            return exact, True
+        return [(h, n) for _, _, h, n in scored[:5]], False
 
     # ---- the product check (the only thing that can trigger an alert)
     async def check(self, handle, confirm=False):
@@ -1334,13 +1369,15 @@ class Monitor:
         if cmd == "find":
             if not args:
                 return "Usage: `!find mew` - search the products the collection scan has seen, to get their exact name."
-            hits = self.find(args)
+            hits, exact = self.find(args)
             if not hits:
                 return (f"No product with '{' '.join(args)}' among the {len(self.names)} products I've seen so far. "
-                        f"Try fewer words, or wait for the collection scan to finish a round.")
+                        f"Try other words, or wait for the collection scan to finish a round.")
             lines = [f"`{h}` {n[:60]}: {self.reasons.get(h, ('not checked yet',))[0][:70]}" for h, n in hits[:10]]
             more = f"\n...and {len(hits) - 10} more, add a word to narrow it down." if len(hits) > 10 else ""
-            return (f"Found {len(hits)}:\n" + "\n".join(lines) + more +
+            head = (f"Found {len(hits)}:" if exact else
+                    f"Nothing has all of '{' '.join(args)}'. Closest matches:")
+            return (head + "\n" + "\n".join(lines) + more +
                     "\nTo watch one, copy its name in grey: `!watch <name>`.")
 
         if cmd == "why":
@@ -1362,7 +1399,7 @@ class Monitor:
                     "`!remove <link>` - stop watching it\n"
                     "`!list` - what I'm watching and why each isn't alerting\n"
                     "`!why <link>` - the reason for my latest decision on one product\n"
-                    "`!find <words>` - search the products the collection scan has seen (e.g. `!find mew`)\n"
+                    "`!find <words>` - search the products the collection scan has seen, any order, short forms OK (e.g. `!find 30th upc night`, `!find etb`)\n"
                     "`!pause` / `!resume` - stop or restart all requests\n"
                     "`!refresh` - start a fresh check round right now\n"
                     "`!status` - am I running, blocked or paused, and what the collection scan sees\n"

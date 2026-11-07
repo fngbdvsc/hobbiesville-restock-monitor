@@ -426,6 +426,30 @@ class TestCollectionScan(unittest.TestCase):
         new = [a for a in alerts if a["kind"] == "New Item"][0]
         self.assertIn("published 2 h ago", new["why"])
 
+    def test_find_short_forms_any_order_and_closest(self):
+        mon, _, _, _ = make_monitor(FakeSession([(200, js_product(), None)]))
+        mon.names = {
+            "pokemon-30th-celebration-ultra-premium-collection-night": "Pokemon TCG: 30th Celebration Ultra-Premium Collection (Night)",
+            "pokemon-30th-celebration-ultra-premium-collection-day": "Pokemon TCG: 30th Celebration Ultra-Premium Collection (Day)",
+            "mega-evolution-elite-trainer-box": "Mega Evolution Elite Trainer Box",
+            "charizard-ex-super-premium-collection": "Charizard ex Super Premium Collection",
+        }
+        hits, exact = mon.find(["30th", "night", "upc"])
+        self.assertTrue(exact)
+        self.assertEqual([h for h, _ in hits], ["pokemon-30th-celebration-ultra-premium-collection-night"])
+        hits, _ = mon.find(["upc", "night", "30th"])                 # order doesn't matter
+        self.assertEqual(len(hits), 1)
+        self.assertEqual([h for h, _ in mon.find(["etb"])[0]], ["mega-evolution-elite-trainer-box"])
+        self.assertEqual([h for h, _ in mon.find(["spc"])[0]], ["charizard-ex-super-premium-collection"])
+        self.assertEqual(len(mon.find(["char"])[0]), 1)              # start of a word still works
+        hits, exact = mon.find(["30th", "night", "upc", "sealed"])  # one word too many
+        self.assertFalse(exact)
+        self.assertEqual(hits[0][0], "pokemon-30th-celebration-ultra-premium-collection-night")
+        reply = mon.command("!find 30th night upc sealed")
+        self.assertIn("Closest matches", reply)
+        self.assertIn("ultra-premium-collection-night", reply)
+        self.assertIn("Found 2", mon.command("!find upc 30th"))
+
     def test_404_suggests_close_match_and_find(self):
         real = "pokemon-tcg-30th-celebration-mew-premium-collection"
         s = FakeSession([coll_page([coll_product(real, False, title="Pokemon TCG: 30th Celebration Mew Premium Collection"),
