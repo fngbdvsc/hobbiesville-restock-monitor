@@ -469,6 +469,27 @@ class TestCollectionScan(unittest.TestCase):
         self.assertIn("CA store again", texts[-1])
         self.assertNotIn("WRONG", mon.command("!status"))
 
+    def test_skip_singles_graded_toys_but_keep_sealed(self):
+        skip = [("Charizard ex 199/165 Special Illustration Rare", "Pokemon Single"),
+                ("Pikachu Illustrator PSA 10", "Pokemon"),
+                ("Umbreon VMAX Alt Art BGS 9.5", ""),
+                ("Graded Mew Gold Star", ""),
+                ("Pikachu 8 inch Plush", "Toys"),
+                ("Charizard Funko Pop!", ""),
+                ("Ultra Pro Pikachu Sleeves", "Accessories"),
+                ("Pokemon Center Hoodie", "Apparel")]
+        keep = [("Mega Evolution Elite Trainer Box", "Sealed"),
+                ("Charizard ex Premium Figure Collection", "Sealed"),
+                ("Scarlet & Violet 151 Binder Collection", ""),
+                ("Pokemon 30th Celebration Mew Collection (Pre-Order)", "Sealed"),
+                ("Pikachu Plush Box with 4 Booster Packs", "Sealed"),
+                ("Prismatic Evolutions Booster Bundle", ""),
+                ("Surging Sparks Booster Box", "Toys & Games")]
+        for name, ptype in skip:
+            self.assertTrue(hm.excluded(name, ptype), name)
+        for name, ptype in keep:
+            self.assertFalse(hm.excluded(name, ptype), name)
+
     def test_saved_memory_means_no_learning_scan(self):
         s = FakeSession([coll_page([coll_product("etb", True)])])
         mon, alerts, _, _ = make_monitor(s)

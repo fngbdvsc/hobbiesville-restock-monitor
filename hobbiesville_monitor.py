@@ -71,8 +71,15 @@ SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "4"))   # at most this many pages 
 PAGE_SIZE = 250
 NEW_ITEM_HOURS = 48            # "New Item" only for listings published in the last 48 hours (see scan())
 PING_ON_NEW_ITEM = True        # ping the role for New Item alerts too, not just restocks
+# Skipped by the collection scan (watched products are always checked). Shopify "product type" first:
+SKIP_TYPES = ("single", "graded", "slab", "toy", "plush", "figure", "apparel", "clothing", "accessor",
+              "supplies", "sleeve")
+# ...then words in the product name, unless the name says it comes with booster packs (KEEP_WORDS).
 EXCLUDE_WORDS = ["sleeve", "binder", "deck box", "playmat", "plush", "t-shirt", "shirt", "hoodie", "mug",
-                 "backpack", "figure", "toploader", "card saver", "portfolio", "storage box"]
+                 "backpack", "figure", "toploader", "card saver", "portfolio", "storage box", "funko",
+                 "squishmallow", "keychain", "lanyard", "pop!"]
+KEEP_WORDS = ("booster", "pack", "elite trainer", "etb", "collection box", "premium collection",
+              "figure collection", "binder collection")
 
 # On Railway, files vanish on every redeploy unless you attach a Volume (mount it at /data and set DATA_DIR=/data)
 DATA_DIR = os.environ.get("DATA_DIR", ".")
@@ -193,12 +200,19 @@ def collection_data_url(coll, page=1):
     return f"{collection_url(coll)}/products.json?limit={PAGE_SIZE}&page={page}"
 
 
+GRADED_RE = re.compile(r"\b(?:psa|bgs|cgc|sgc|tag)\s*(?:\d|gem|mint|pristine|black label)|\bgraded\b|\bslab\b", re.I)
+
+
 def excluded(name, product_type=None):
-    """Accessories and single cards in the collection don't alert (single cards are listed and sold all day)."""
+    """Singles, graded cards, toys and accessories in the collection don't alert. Singles and graded cards are
+    one-of-a-kind listings sold all day; toys and accessories aren't TCG restocks."""
     n = (name or "").lower()
-    if any(w in n for w in EXCLUDE_WORDS):
+    t = str(product_type or "").lower()
+    if GRADED_RE.search(n) or any(w in t for w in ("single", "graded", "slab")):
         return True
-    return "single" in str(product_type or "").lower()
+    if any(w in n for w in KEEP_WORDS):
+        return False            # "Premium Figure Collection", "Binder Collection" etc. come with booster packs
+    return any(w in t for w in SKIP_TYPES) or any(w in n for w in EXCLUDE_WORDS)
 
 
 def hours_since(stamp, now=None):
@@ -1030,13 +1044,16 @@ class Monitor:
         # With no saved memory (first start, or a redeploy without a Volume), the first read of each page only
         # learns what's there. Otherwise every in-stock product would ping at once.
         silent = self.fresh_start and (coll, page) not in self.baselined
-        alerts = 0
+        alerts = skipped = 0
         for raw in val:
             if not isinstance(raw, dict):
                 continue
             handle = parse_handle(str(raw.get("handle") or ""))
             v = parse_product_data(raw)
-            if not handle or v is None or excluded(v["name"], raw.get("product_type")):
+            if not handle or v is None:
+                continue
+            if excluded(v["name"], raw.get("product_type")):
+                skipped += 1
                 continue
             self.names[handle] = v["name"]
             ok = is_ok(v)
@@ -1066,7 +1083,8 @@ class Monitor:
             await self._alert({"kind": kind, "name": v["name"], "sku": handle, "v": v, "why": why,
                                "url": product_url(handle)})
         self.baselined.add((coll, page))
-        print(f"[scan] {coll} page {page}: {len(val)} products, {alerts} alert(s)"
+        print(f"[scan] {coll} page {page}: {len(val)} products ({skipped} skipped: singles/graded/toys/"
+              f"accessories), {alerts} alert(s)"
               f"{' (first read: learning only, no alerts)' if silent else ''}")
         if len(val) >= PAGE_SIZE:
             if page < SCAN_PAGES:
