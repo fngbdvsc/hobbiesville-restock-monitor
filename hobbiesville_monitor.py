@@ -1012,11 +1012,36 @@ class Monitor:
         else:
             self.scan_counts[coll] = (page - 1) * PAGE_SIZE + len(val)
 
+    def similar_handles(self, handle, n=3):
+        """Products the scan has seen whose link/name shares most of the meaningful words of a wrong link."""
+        filler = {"pre", "order", "preorder", "pokemon", "tcg", "the", "and", "for", "with"}
+        want = {w for w in handle.split("-") if len(w) > 1 and w not in filler}
+        if not want:
+            return []
+        scored = []
+        for h, name in self.names.items():
+            if h == handle:
+                continue
+            words = set(re.split(r"[^a-z0-9]+", (h + " " + name).lower()))
+            score = len(want & words)
+            if score >= max(1, (len(want) + 1) // 2):
+                scored.append((-score, h))
+        return [h for _, h in sorted(scored)[:n]]
+
+    def find(self, words):
+        words = [w.lower() for w in words]
+        return sorted((h, n) for h, n in self.names.items() if all(w in (h + " " + n).lower() for w in words))
+
     # ---- the product check (the only thing that can trigger an alert)
     async def check(self, handle, confirm=False):
         kind, val = await self.fetch(handle)
         if kind != "ok":
             reason = reason_text(None, False, val if kind == "unreadable" else kind)
+            if kind == "missing":
+                close = self.similar_handles(handle)
+                if close:
+                    reason += (" Did you mean " + " or ".join(f"`{h}` ({self.names[h][:60]})" for h in close) +
+                               "? Products seen by the collection scan can be searched with `!find`.")
             if self.set_reason(handle, reason):
                 print(f"[not posted] {handle}: {reason}")
             if kind != "password":
@@ -1220,6 +1245,18 @@ class Monitor:
                     f"Requests made since start: {self.requests_made}. Last request {since}s ago.\n"
                     f"Queued extra checks: {len(self.priority)}.")
 
+        if cmd == "find":
+            if not args:
+                return "Usage: `!find mew` - search the products the collection scan has seen, to get their exact name."
+            hits = self.find(args)
+            if not hits:
+                return (f"No product with '{' '.join(args)}' among the {len(self.names)} products I've seen so far. "
+                        f"Try fewer words, or wait for the collection scan to finish a round.")
+            lines = [f"`{h}` {n[:60]}: {self.reasons.get(h, ('not checked yet',))[0][:70]}" for h, n in hits[:10]]
+            more = f"\n...and {len(hits) - 10} more, add a word to narrow it down." if len(hits) > 10 else ""
+            return (f"Found {len(hits)}:\n" + "\n".join(lines) + more +
+                    "\nTo watch one, copy its name in grey: `!watch <name>`.")
+
         if cmd == "why":
             if not args:
                 return "Usage: `!why <product link or name>`"
@@ -1239,6 +1276,7 @@ class Monitor:
                     "`!remove <link>` - stop watching it\n"
                     "`!list` - what I'm watching and why each isn't alerting\n"
                     "`!why <link>` - the reason for my latest decision on one product\n"
+                    "`!find <words>` - search the products the collection scan has seen (e.g. `!find mew`)\n"
                     "`!pause` / `!resume` - stop or restart all requests\n"
                     "`!refresh` - start a fresh check round right now\n"
                     "`!status` - am I running, blocked or paused, and what the collection scan sees\n"

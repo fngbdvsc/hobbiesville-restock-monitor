@@ -426,6 +426,25 @@ class TestCollectionScan(unittest.TestCase):
         new = [a for a in alerts if a["kind"] == "New Item"][0]
         self.assertIn("published 2 h ago", new["why"])
 
+    def test_404_suggests_close_match_and_find(self):
+        real = "pokemon-tcg-30th-celebration-mew-premium-collection"
+        s = FakeSession([coll_page([coll_product(real, False, title="Pokemon TCG: 30th Celebration Mew Premium Collection"),
+                                    coll_product("mega-evolution-etb", True)])])
+        mon, _, _, _ = make_monitor(s)
+
+        async def go():
+            await mon.scan(COLL, 1)
+            s.responses = [(404, NOT_FOUND, None)]
+            await mon.check("pokemon-30th-celebration-mew-collection-pre-order")
+        run(go())
+        self.assertIn(f"Did you mean `{real}`", mon.reasons["pokemon-30th-celebration-mew-collection-pre-order"][0])
+        self.assertNotIn("mega-evolution-etb", mon.reasons["pokemon-30th-celebration-mew-collection-pre-order"][0])
+        reply = mon.command("!find mew")
+        self.assertIn(real, reply)
+        self.assertIn("Sold out", reply)
+        self.assertIn("Found 1", reply)
+        self.assertIn("No product", mon.command("!find charizard"))
+
     def test_saved_memory_means_no_learning_scan(self):
         s = FakeSession([coll_page([coll_product("etb", True)])])
         mon, alerts, _, _ = make_monitor(s)
