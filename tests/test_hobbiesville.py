@@ -4,6 +4,7 @@ import json
 import asyncio
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 
 os.environ["DATA_DIR"] = tempfile.mkdtemp()
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -75,6 +76,7 @@ def make_monitor(session, **kw):
     async def send_text(t):
         texts.append(t)
 
+    kw.setdefault("collections", [])
     mon = hm.Monitor(session, send_alert, send_text, clock=clock, sleep=clock.sleep,
                      rand=lambda a, b: a, **kw)
     return mon, alerts, texts, clock
@@ -205,8 +207,8 @@ class TestMonitor(unittest.TestCase):
         self.assertIn("First check", alerts[0]["why"])
         self.assertIn("$54.99", alerts[1]["why"])
         self.assertIn("Before: Sold out", alerts[1]["why"])
-        self.assertEqual(alerts[1]["url"], URL)
-        self.assertEqual(s.urls[0], URL + ".js")
+        self.assertEqual(alerts[1]["url"], hm.product_url(HANDLE))
+        self.assertEqual(s.urls[0], "https://www.hobbiesville.com/products/" + HANDLE + ".js")
 
     def test_sold_out_never_alerts(self):
         s = FakeSession([(200, js_product(False), None)])
@@ -347,6 +349,136 @@ class TestMonitor(unittest.TestCase):
         self.assertIsNone(mon.command("hello"))
         dash, _, _, _ = make_monitor(FakeSession([(200, js_product(), None)]), dashboard=object())
         self.assertIn("dashboard controls", dash.command("!watch " + URL))
+
+
+USER_LINK = ("https://www.hobbiesville.com/collections/pokemon-trading-cards?_su_rec=Gaq0qHa4fSC9JyMc"
+             "&_su_rec_id=f97bebf2-6b9a-494b-8dcc-29967430d12d-1794050472")
+COLL = "pokemon-trading-cards"
+
+
+def iso_hours_ago(h):
+    return (datetime.now(timezone.utc) - timedelta(hours=h)).isoformat()
+
+
+def coll_product(handle, available, price="49.99", title=None, hours_ago=24 * 30, product_type="Sealed"):
+    """One product the way /collections/<name>/products.json lists it (price in dollars, as text)."""
+    return {"handle": handle, "title": title or handle.replace("-", " ").title(),
+            "product_type": product_type, "published_at": iso_hours_ago(hours_ago),
+            "images": [{"src": "https://cdn.shopify.com/" + handle + ".jpg"}],
+            "variants": [{"title": "Default Title", "price": price, "available": available}]}
+
+
+def coll_page(products):
+    return (200, json.dumps({"products": products}), None)
+
+
+class TestCollectionScan(unittest.TestCase):
+    def test_parse_collection(self):
+        self.assertEqual(hm.parse_collection(USER_LINK), COLL)
+        self.assertEqual(hm.parse_collection(COLL), COLL)
+        self.assertIsNone(hm.parse_collection("0"))
+        self.assertIsNone(hm.parse_collection("https://www.amazon.ca/collections/x"))
+        self.assertEqual(hm.scan_collections(f"{USER_LINK}, pokemon-booster-boxes ,0"),
+                         [COLL, "pokemon-booster-boxes"])
+        self.assertEqual(hm.scan_collections("0"), [])
+        self.assertEqual(hm.collection_data_url(COLL, 2),
+                         "https://www.hobbiesville.com/collections/pokemon-trading-cards/products.json?limit=250&page=2")
+
+    def test_classify_collection(self):
+        self.assertEqual(hm.classify_collection(*coll_page([coll_product("a", True)])[:2], "")[0], "ok")
+        self.assertEqual(hm.classify_collection(404, NOT_FOUND, "")[0], "missing")
+        self.assertEqual(hm.classify_collection(403, CLOUDFLARE, "")[0], "blocked")
+        self.assertEqual(hm.classify_collection(200, js_product(), "")[0], "unreadable")
+
+    def test_first_scan_learns_then_alerts(self):
+        s = FakeSession([coll_page([coll_product("etb", False), coll_product("bundle", True)])])
+        mon, alerts, _, _ = make_monitor(s)
+
+        async def go():
+            await mon.scan(COLL, 1)                     # first read: learn only
+            self.assertEqual(alerts, [])
+            s.responses = [coll_page([
+                coll_product("etb", True, "64.99"),      # was sold out -> Restock
+                coll_product("bundle", True),            # still in stock -> silent
+                coll_product("brand-new-box", True, hours_ago=2),   # just published -> New Item
+                coll_product("old-box", True),           # first seen but published long ago -> silent
+                coll_product("charizard-ex-single", True, product_type="Pokemon Single"),  # single -> skipped
+                coll_product("pikachu-sleeves", True, hours_ago=1),  # accessory -> skipped
+            ])]
+            await mon.scan(COLL, 1)
+        run(go())
+        kinds = sorted((a["kind"], a["sku"]) for a in alerts)
+        self.assertEqual(kinds, [("New Item", "brand-new-box"), ("Restock", "etb")])
+        restock = [a for a in alerts if a["kind"] == "Restock"][0]
+        self.assertIn("collection scan", restock["why"])
+        self.assertIn("$64.99", restock["why"])
+        self.assertEqual(restock["url"], "https://www.hobbiesville.com/products/etb")
+        self.assertEqual(restock["v"]["image"], "https://cdn.shopify.com/etb.jpg")
+        new = [a for a in alerts if a["kind"] == "New Item"][0]
+        self.assertIn("published 2 h ago", new["why"])
+
+    def test_saved_memory_means_no_learning_scan(self):
+        s = FakeSession([coll_page([coll_product("etb", True)])])
+        mon, alerts, _, _ = make_monitor(s)
+        mon.fresh_start = False
+        mon.state = {"stock:etb": False}
+        run(mon.scan(COLL, 1))
+        self.assertEqual([a["kind"] for a in alerts], ["Restock"])
+
+    def test_scan_and_watch_share_one_alert(self):
+        s = FakeSession([coll_page([coll_product(HANDLE, False)])])
+        mon, alerts, _, _ = make_monitor(s)
+
+        async def go():
+            await mon.scan(COLL, 1)
+            s.responses = [coll_page([coll_product(HANDLE, True)])]
+            await mon.scan(COLL, 1)                     # restock alert from the scan
+            s.responses = [(200, js_product(True), None)]
+            await mon.check(HANDLE)                     # same restock seen on the product: no second alert
+        run(go())
+        self.assertEqual(len(alerts), 1)
+
+    def test_full_page_queues_next_page(self):
+        full = [coll_product(f"p{i}", False) for i in range(250)]
+        s = FakeSession([coll_page(full)])
+        mon, _, _, _ = make_monitor(s)
+        run(mon.scan(COLL, 1))
+        self.assertEqual(list(mon.round)[0], ("scan", COLL, 2))
+        s.responses = [coll_page(full[:10])]
+        run(mon.scan(COLL, 2))
+        self.assertEqual(mon.scan_counts[COLL], 260)
+
+    def test_missing_collection_reports_error(self):
+        errors = []
+
+        async def send_error(t):
+            errors.append(t)
+        mon, alerts, _, _ = make_monitor(FakeSession([(404, NOT_FOUND, None)]), send_error=send_error)
+
+        async def go():
+            await mon.scan(COLL, 1)
+            await asyncio.sleep(0)
+        run(go())
+        self.assertEqual(alerts, [])
+        self.assertIn("doesn't exist", errors[0])
+
+    def test_block_on_scan_backs_off_and_retries(self):
+        blocked = FakeSession([(429, "Too Many Requests", None)])
+        fresh = FakeSession([coll_page([coll_product("etb", False)])])
+        mon, _, texts, _ = make_monitor(blocked, session_factory=lambda: fresh, collections=[COLL])
+
+        async def go():
+            await mon.tick()
+            self.assertTrue(mon.was_blocked)
+            self.assertIn("collection list", texts[-1])
+            for _ in range(200):
+                if not mon.was_blocked:
+                    break
+                await mon.tick()
+        run(go())
+        self.assertFalse(mon.was_blocked)
+        self.assertIn("/collections/pokemon-trading-cards/products.json", fresh.urls[0])
+        self.assertIn(("pokemon-trading-cards", 1), mon.baselined)
 
 
 class TestDashboard(unittest.TestCase):

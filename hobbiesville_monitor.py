@@ -7,6 +7,8 @@ The bot reads that with plain web requests, so it needs very little memory.
 
 - Every request to Hobbiesville is spaced 8-15 seconds apart (random).
 - An alert posts once when a watched product comes into stock, and re-arms when it sells out.
+- Collection scan (SCAN_COLLECTIONS, default pokemon-trading-cards): one request reads up to 250 products of a
+  collection with their price and stock, so restocks of products you didn't add and brand-new listings alert too.
 - It always tells you WHY (in alerts, status messages, and with !why).
 - If DASHBOARD_URL and BOT_API_KEY are set, the dashboard supplies the product list (entries whose store
   starts with "hobbiesville") and the pause state, and gets a copy of every alert, error and status message.
@@ -15,6 +17,7 @@ The bot reads that with plain web requests, so it needs very little memory.
 
 Setup:              python3 -m pip install -r requirements.txt
 Check one product:  python3 hobbiesville_monitor.py debug https://hobbiesville.com/products/<name>
+Check a collection: python3 hobbiesville_monitor.py scan https://www.hobbiesville.com/collections/pokemon-trading-cards
 Check a saved file: python3 hobbiesville_monitor.py parse saved.js
 Run:                python3 hobbiesville_monitor.py
 
@@ -30,7 +33,7 @@ import random
 import asyncio
 import html as htmllib
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from urllib.parse import unquote, urlsplit
 
@@ -60,11 +63,22 @@ BLOCK_UPDATE_SECONDS = 600     # while a block lasts, post a "still blocked" upd
 # Starting watchlist when there's no dashboard (after that, use !watch / !remove in Discord - changes are saved)
 WATCH_PRODUCTS = []
 
+# Collection scan: every round, also read whole collection lists. One request = up to 250 products, each with
+# its price and whether it can be bought, so it catches restocks of products you never added and brand-new
+# listings. Comma-separated collection names or links. Set SCAN_COLLECTIONS=0 to turn it off.
+SCAN_COLLECTIONS_RAW = os.environ.get("SCAN_COLLECTIONS", "pokemon-trading-cards")
+SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "4"))   # at most this many pages of 250 products per collection
+PAGE_SIZE = 250
+NEW_ITEM_HOURS = 48            # "New Item" only for listings published in the last 48 hours (see scan())
+PING_ON_NEW_ITEM = True        # ping the role for New Item alerts too, not just restocks
+EXCLUDE_WORDS = ["sleeve", "binder", "deck box", "playmat", "plush", "t-shirt", "shirt", "hoodie", "mug",
+                 "backpack", "figure", "toploader", "card saver", "portfolio", "storage box"]
+
 # On Railway, files vanish on every redeploy unless you attach a Volume (mount it at /data and set DATA_DIR=/data)
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 STATE_FILE = os.path.join(DATA_DIR, "hobbiesville_state.json")
 CONFIG_FILE = os.path.join(DATA_DIR, "hobbiesville_config.json")
-BASE = "https://hobbiesville.com"
+BASE = "https://www.hobbiesville.com"
 HOSTS = ("hobbiesville.com", "www.hobbiesville.com")
 
 # An honest name for this bot. It doesn't pretend to be a browser.
@@ -121,12 +135,69 @@ def parse_handle(s):
     return s if HANDLE_RE.match(s) else None
 
 
+def parse_collection(s):
+    """A collection link or name -> its name. https://www.hobbiesville.com/collections/pokemon-trading-cards?x=1
+    -> pokemon-trading-cards"""
+    s = (s or "").strip().strip("`<>")
+    if "/" in s or "." in s:
+        u = urlsplit(s if "://" in s else "https://" + s)
+        if (u.hostname or "").lower() not in HOSTS:
+            return None
+        m = re.search(r"/collections/([^/?#]+)", u.path)
+        if not m:
+            return None
+        s = unquote(m.group(1))
+    s = s.lower()
+    if s in ("0", "off", "none", "no"):
+        return None
+    return s if HANDLE_RE.match(s) else None
+
+
+def scan_collections(raw):
+    out = []
+    for part in (raw or "").split(","):
+        c = parse_collection(part)
+        if c and c not in out:
+            out.append(c)
+    return out
+
+
+SCAN_COLLECTIONS = scan_collections(SCAN_COLLECTIONS_RAW)
+
+
 def product_url(handle):
     return f"{BASE}/products/{handle}"
 
 
 def product_data_url(handle):
     return product_url(handle) + ".js"
+
+
+def collection_url(coll):
+    return f"{BASE}/collections/{coll}"
+
+
+def collection_data_url(coll, page=1):
+    return f"{collection_url(coll)}/products.json?limit={PAGE_SIZE}&page={page}"
+
+
+def excluded(name, product_type=None):
+    """Accessories and single cards in the collection don't alert (single cards are listed and sold all day)."""
+    n = (name or "").lower()
+    if any(w in n for w in EXCLUDE_WORDS):
+        return True
+    return "single" in str(product_type or "").lower()
+
+
+def hours_since(stamp, now=None):
+    """Hours since a Shopify time like 2026-11-05T10:00:00-05:00. None if it can't be read."""
+    try:
+        t = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        return None
+    return ((now or datetime.now(timezone.utc)) - t).total_seconds() / 3600
 
 
 def money(p):
@@ -172,6 +243,11 @@ def parse_product_json(text):
         return None
     if isinstance(data, dict) and isinstance(data.get("product"), dict):
         data = data["product"]
+    return parse_product_data(data)
+
+
+def parse_product_data(data):
+    """One product, already decoded (from a product page's data or from a collection list)."""
     if not isinstance(data, dict) or not data.get("title") or not isinstance(data.get("variants"), list):
         return None
     variants = []
@@ -240,12 +316,36 @@ def classify_response(status, text, final_url=""):
     v = parse_product_json(text) if status == 200 else None
     if v is not None:
         return "ok", v
+    return _refusal(status, text, final_url, "/products/")
+
+
+def classify_collection(status, text, final_url=""):
+    """Same idea for a collection list. ("ok", [raw products]) when it's readable."""
+    path = urlsplit(final_url or "").path.lower().rstrip("/")
+    if path.endswith("/password"):
+        return "password", None
+    if status == 404:
+        return "missing", None
+    if status == 429:
+        return "blocked", "HTTP 429 (too many requests)"
+    if status == 200:
+        try:
+            data = json.loads(text or "")
+        except ValueError:
+            data = None
+        if isinstance(data, dict) and isinstance(data.get("products"), list):
+            return "ok", data["products"]
+    return _refusal(status, text, final_url, "/collections/")
+
+
+def _refusal(status, text, final_url, expected_path):
+    path = urlsplit(final_url or "").path.lower()
     low = (text or "").lower()
     if status in (403, 503) or any(m in low for m in CHALLENGE_MARKERS):
         return "blocked", (f'HTTP {status}, page title "{page_title(text)}", '
                            f'page says: "{page_excerpt(text)}"')
     detail = f"HTTP {status}"
-    if final_url and "/products/" not in path:
+    if final_url and expected_path not in path:
         detail += f", it sent me to {final_url}"
     return "unreadable", detail
 
@@ -417,8 +517,12 @@ class Monitor:
 
     def __init__(self, session, send_alert, send_text,
                  clock=time.monotonic, sleep=asyncio.sleep, rand=random.uniform,
-                 dashboard=None, shipper=None, session_factory=None, send_error=None):
+                 dashboard=None, shipper=None, session_factory=None, send_error=None, collections=None):
         self.session = session
+        self.collections = list(SCAN_COLLECTIONS if collections is None else collections)
+        self.baselined = set()     # (collection, page) pages read at least once since start
+        self.scan_counts = {}      # collection -> products seen on its last full scan
+        self._noted = set()
         self.send_alert = send_alert
         self.send_text = send_text
         self.send_error = send_error
@@ -432,6 +536,7 @@ class Monitor:
         self._err_seen = {}
 
         st = load_json(STATE_FILE)
+        self.fresh_start = not isinstance(st, dict)   # no saved memory: the first scan only learns, no alerts
         self.state = st if isinstance(st, dict) else {}
         cfg = load_json(CONFIG_FILE)
         if isinstance(cfg, dict) and isinstance(cfg.get("watch"), list):
@@ -505,6 +610,7 @@ class Monitor:
         except Exception as e:
             print(f"[discord] couldn't send alert: {e}")
         v = alert["v"]
+        print(f"[ALERT] {alert['kind']}: {alert['name']} | {alert['why']}")
         self.dash_log("message", f"{alert['kind']}: {alert['name']} | {money(v['price'])} | "
                                  f"{alert['url']} | {alert['why']}", alert["sku"])
 
@@ -517,7 +623,7 @@ class Monitor:
         save_json(CONFIG_FILE, {"watch": self.watch})
 
     def round_estimate(self):
-        jobs = len(self.watch)
+        jobs = len(self.watch) + len(self.collections)
         return max(int(jobs * (GAP_MIN + GAP_MAX) / 2), MIN_SECONDS_PER_ROUND if jobs else 0)
 
     async def wait_turn(self):
@@ -529,12 +635,20 @@ class Monitor:
         self.requests_made += 1
 
     def _drop(self, handle):
-        self.round = deque(j for j in self.round if j[1] != handle)
-        self.priority = deque(j for j in self.priority if j[1] != handle)
+        self.round = deque(j for j in self.round if not (j[0] == "item" and j[1] == handle))
+        self.priority = deque(j for j in self.priority if not (j[0] == "item" and j[1] == handle))
+
+    @staticmethod
+    def describe(job):
+        if not job:
+            return "unknown page"
+        if job[0] == "scan":
+            return f"the '{job[1]}' collection list (page {job[2]})"
+        return f"the product {job[1]}"
 
     # ---- rounds
     def build_round(self):
-        jobs = [("item", h, False) for h in self.watch]
+        jobs = [("item", h, False) for h in self.watch] + [("scan", c, 1) for c in self.collections]
         random.shuffle(jobs)                  # different order every round, less robotic
         self.round = deque(jobs)
         self.next_round_at = self.clock() + MIN_SECONDS_PER_ROUND
@@ -578,7 +692,10 @@ class Monitor:
             if self.paused:                      # paused while we were waiting
                 self.priority.appendleft(job)
                 return
-            await self.check(job[1], confirm=job[2])
+            if job[0] == "scan":
+                await self.scan(job[1], job[2])
+            else:
+                await self.check(job[1], confirm=job[2])
             self.good_pages += 1
             if self.was_blocked:
                 self.was_blocked = False
@@ -587,7 +704,7 @@ class Monitor:
                 tries = (f" after {self.blocks_in_row} blocked tries over {mins:.0f} min"
                          if self.blocks_in_row > 1 else f" after {mins:.0f} min")
                 await self._say(f"Back to normal{tries}: Hobbiesville is returning product data again, "
-                                f"resuming checks. Got through on: {job[1]}.")
+                                f"resuming checks. Got through on: {self.describe(job)}.")
         except Blocked as b:
             await self.on_blocked(job, b)
         except asyncio.CancelledError:
@@ -601,13 +718,14 @@ class Monitor:
         first_block = not self.was_blocked
         self.was_blocked = True
         self.blocks_in_row = 1 if first_block else self.blocks_in_row + 1
-        where = job[1] if job else "unknown product"
+        where = self.describe(job)
         good, self.good_pages = self.good_pages, 0
         wait = f"{self.backoff / 60:.0f} min" if self.backoff >= 120 else f"{self.backoff:.0f} seconds"
         self.blocked_until = self.clock() + self.backoff
         if job is not None:
             self.priority.appendleft(job)
-            self.set_reason(job[1], BLOCK_REASON)
+            if job[0] == "item":
+                self.set_reason(job[1], BLOCK_REASON)
         await self.reset_session()
         msg = (f"Hobbiesville refused my request (bot check or 'too many requests'). Blocked on: {where}, "
                f"after {good} request(s) worked. I'm pausing ALL requests for {wait}, then I'll retry on "
@@ -646,6 +764,79 @@ class Monitor:
             raise Blocked(val)
         return kind, val
 
+    async def fetch_collection(self, coll, page):
+        try:
+            r = await self.session.get(collection_data_url(coll, page))
+        except Exception as e:
+            detail = (str(e).strip().splitlines() or [""])[0][:150]
+            return "unreadable", f"error: {type(e).__name__}{': ' + detail if detail else ''}"
+        kind, val = classify_collection(r.status_code, r.text, r.url)
+        if kind == "blocked":
+            raise Blocked(val)
+        return kind, val
+
+    # ---- collection scan: restocks of anything in the collection + brand-new listings
+    async def scan(self, coll, page):
+        kind, val = await self.fetch_collection(coll, page)
+        if kind != "ok":
+            if kind == "password":
+                print(f"[scan] {coll}: the store is behind its password page, skipping this scan")
+                return
+            reason = (f"the collection '{coll}' doesn't exist on Hobbiesville (HTTP 404). Check SCAN_COLLECTIONS."
+                      if kind == "missing" else f"couldn't read the collection list ({val}).")
+            self.dash_error(f"scan:{coll}", f"Collection scan, page {page}: {reason}")
+            return
+        # With no saved memory (first start, or a redeploy without a Volume), the first read of each page only
+        # learns what's there. Otherwise every in-stock product would ping at once.
+        silent = self.fresh_start and (coll, page) not in self.baselined
+        alerts = 0
+        for raw in val:
+            if not isinstance(raw, dict):
+                continue
+            handle = parse_handle(str(raw.get("handle") or ""))
+            v = parse_product_data(raw)
+            if not handle or v is None or excluded(v["name"], raw.get("product_type")):
+                continue
+            self.names[handle] = v["name"]
+            ok = is_ok(v)
+            key = f"stock:{handle}"
+            seen = key in self.state
+            prev = self.state.get(key)
+            self.state[key] = ok
+            prev_reason = self.reasons.get(handle, (None,))[0]
+            reason = reason_text(v, ok)
+            self.set_reason(handle, reason)
+            if silent or not ok or prev is True:
+                continue
+            if seen:
+                kind = "Restock"
+                why = f"Found by the collection scan ({coll}): it was sold out last time. {reason}"
+                if prev_reason and prev_reason != reason and prev_reason != BLOCK_REASON:
+                    why += f" Before: {prev_reason}"
+            else:
+                # First time this product shows up. Collections get re-sorted (e.g. best-selling), so an old
+                # listing can move into the pages being scanned. Only a recently published one counts as new.
+                age = hours_since(raw.get("published_at") or raw.get("created_at"))
+                if age is None or age > NEW_ITEM_HOURS:
+                    continue
+                kind = "New Item"
+                why = (f"New listing in the '{coll}' collection, published {max(age, 0):.0f} h ago. {reason}")
+            alerts += 1
+            await self._alert({"kind": kind, "name": v["name"], "sku": handle, "v": v, "why": why,
+                               "url": product_url(handle)})
+        self.baselined.add((coll, page))
+        print(f"[scan] {coll} page {page}: {len(val)} products, {alerts} alert(s)"
+              f"{' (first read: learning only, no alerts)' if silent else ''}")
+        if len(val) >= PAGE_SIZE:
+            if page < SCAN_PAGES:
+                self.round.appendleft(("scan", coll, page + 1))
+            elif coll not in self._noted:
+                self._noted.add(coll)
+                await self._say(f"The '{coll}' collection has more than {SCAN_PAGES * PAGE_SIZE} products. "
+                                f"I only scan the first {SCAN_PAGES * PAGE_SIZE} (raise SCAN_PAGES to scan more).")
+        else:
+            self.scan_counts[coll] = (page - 1) * PAGE_SIZE + len(val)
+
     # ---- the product check (the only thing that can trigger an alert)
     async def check(self, handle, confirm=False):
         kind, val = await self.fetch(handle)
@@ -663,7 +854,7 @@ class Monitor:
         name = v["name"] or self.names.get(handle) or handle
         self.names[handle] = name
         ok = is_ok(v)
-        key = f"watch:{handle}"
+        key = f"stock:{handle}"        # shared with the collection scan, so one restock alerts only once
         prev = self.state.get(key)
         self.state[key] = ok
         prev_reason = self.reasons.get(handle, (None,))[0]
@@ -842,8 +1033,14 @@ class Monitor:
             else:
                 state = "running"
             since = int(self.clock() - self.last_request)
-            return (f"Status: {state}\nWatching {len(self.watch)} product(s), each checked about every "
+            if self.collections:
+                scan = ", ".join(f"{c} ({self.scan_counts[c]} products)" if c in self.scan_counts else f"{c} (not read yet)"
+                                 for c in self.collections)
+            else:
+                scan = "off"
+            return (f"Status: {state}\nWatching {len(self.watch)} product(s), checked about every "
                     f"{self.round_estimate()}s (requests spaced {GAP_MIN}-{GAP_MAX}s apart).\n"
+                    f"Collection scan: {scan}.\n"
                     f"Method: light (plain web requests, no browser).\n"
                     f"Requests made since start: {self.requests_made}. Last request {since}s ago.\n"
                     f"Queued extra checks: {len(self.priority)}.")
@@ -869,7 +1066,9 @@ class Monitor:
                     "`!why <link>` - the reason for my latest decision on one product\n"
                     "`!pause` / `!resume` - stop or restart all requests\n"
                     "`!refresh` - start a fresh check round right now\n"
-                    "`!status` - am I running, blocked or paused")
+                    "`!status` - am I running, blocked or paused, and what the collection scan sees\n"
+                    "The collection scan (Railway variable SCAN_COLLECTIONS) also alerts on restocks and new "
+                    "listings of products you didn't add.")
         return None
 
 
@@ -909,6 +1108,34 @@ async def debug_product(raw):
             with open(fname, "w") as f:
                 f.write(f"URL: {r.url}\nHTTP: {r.status_code}\n\n{r.text or ''}")
             print(f"  Saved what Hobbiesville sent to {fname}.")
+
+
+async def debug_scan(raw):
+    coll = parse_collection(raw)
+    if not coll:
+        print("That isn't a Hobbiesville collection link (it should look like https://www.hobbiesville.com/collections/<name>).")
+        return
+    async with make_session(get_proxy()) as s:
+        url = collection_data_url(coll)
+        print(f"Loading {url} with plain web requests (no browser)...")
+        r = await s.get(url)
+        print(f"  HTTP {r.status_code}, ended up on {r.url}")
+        kind, val = classify_collection(r.status_code, r.text, r.url)
+        if kind != "ok":
+            print(f"  Result: {kind} {val or ''}")
+            return
+        rows = []
+        for raw_p in val:
+            v = parse_product_data(raw_p) if isinstance(raw_p, dict) else None
+            if v is None:
+                continue
+            skip = excluded(v["name"], raw_p.get("product_type"))
+            rows.append((v, skip))
+        print(f"  {len(val)} products on page 1, {sum(1 for v, s in rows if is_ok(v) and not s)} in stock "
+              f"(not counting skipped accessories/singles).")
+        for v, skip in rows[:25]:
+            flag = "skipped" if skip else ("IN STOCK" if is_ok(v) else "sold out")
+            print(f"  {flag:9} {money(v['price']):>9}  {v['name'][:70]}")
 
 
 def parse_file(path):
@@ -969,7 +1196,9 @@ def run_bot():
                 await self.mon._say(
                     f"Hobbiesville bot online ({where}).\n{proxy_line}\n"
                     f"Method: light (plain web requests to Shopify's product data, no browser).\n"
-                    f"Alerts when a watched product comes into stock. Every request to Hobbiesville is "
+                    f"Collection scan: {', '.join(self.mon.collections) or 'off'}.\n"
+                    f"Alerts when a watched or scanned product comes into stock, or a new one is listed. "
+                    f"Every request to Hobbiesville is "
                     f"{GAP_MIN}-{GAP_MAX}s apart. Type `!help` for commands.")
                 jobs = [self.mon.run(), self.mon.run_sync()]
                 if self.shipper:
@@ -992,7 +1221,8 @@ def run_bot():
 
         async def post_alert(self, a):
             v = a["v"]
-            e = discord.Embed(title=(a["name"] or a["sku"])[:250], url=a["url"], color=0x2ECC71)
+            e = discord.Embed(title=(a["name"] or a["sku"])[:250], url=a["url"],
+                              color=0x2ECC71 if a["kind"] == "Restock" else 0x3498DB)
             e.set_author(name=f"Hobbiesville - {a['kind']}")
             e.add_field(name="Price", value=money(v["price"]))
             if v.get("compare_at"):
@@ -1007,7 +1237,7 @@ def run_bot():
             if v.get("image"):
                 e.set_thumbnail(url=v["image"])
             e.set_footer(text=f"Hobbiesville - verified on the product data - {local_now():%I:%M:%S %p}")
-            ping = f"<@&{role_id}> " if role_id else ""
+            ping = f"<@&{role_id}> " if role_id and (a["kind"] == "Restock" or PING_ON_NEW_ITEM) else ""
             ch = self.get_channel(channel_id)
             if ch is not None:
                 await ch.send(ping, embed=e)
@@ -1037,6 +1267,8 @@ def run_bot():
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "debug":
         asyncio.run(debug_product(sys.argv[2]))
+    elif len(sys.argv) > 2 and sys.argv[1] == "scan":
+        asyncio.run(debug_scan(sys.argv[2]))
     elif len(sys.argv) > 2 and sys.argv[1] == "parse":
         parse_file(sys.argv[2])
     else:
