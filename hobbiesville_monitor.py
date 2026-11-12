@@ -845,12 +845,19 @@ class Monitor:
         except RuntimeError:
             pass
 
-    async def _say(self, text, kind="info", sku=None):
-        """Status messages. With the dashboard connected they go only there, so Discord just gets alerts."""
+    async def _say(self, text, kind="info", sku=None, log=False, copied=False):
+        """Messages from the bot. With the dashboard connected they go only there, so Discord just gets alerts.
+        log=True: a status message (online, blocked, back to normal...). It goes to the error channel when
+        ERROR_CHANNEL_ID is set, so the main channel only gets alerts and replies to your commands.
+        copied=True: it was already copied to the error channel, so don't post it there twice."""
         print(f"[status] {text}")
         if not self.shipper or STATUS_IN_DISCORD:
             try:
-                await self.send_text(text)
+                if log and self.send_error is not None:
+                    if not copied:
+                        await self.send_error(text)
+                else:
+                    await self.send_text(text)
             except Exception as e:
                 print(f"[discord] couldn't send message: {e}")
         self.dash_log(kind, text, sku)
@@ -866,7 +873,8 @@ class Monitor:
         prev, self.last_currency = self.last_currency, cur
         if cur == STORE_CURRENCY:
             if prev:
-                await self._say(f"Hobbiesville is showing me the {STORE_COUNTRY} store again (prices in {cur}).")
+                await self._say(f"Hobbiesville is showing me the {STORE_COUNTRY} store again (prices in {cur}).",
+                                log=True)
             return
         msg = (f"Hobbiesville is showing me its {cur} store, not the {STORE_COUNTRY} one, even after I picked "
                f"{STORE_COUNTRY} in its country picker. Products only sold in {STORE_COUNTRY} will look like "
@@ -874,7 +882,7 @@ class Monitor:
                f"the bot from your Mac would fix this.")
         print(f"[region] {msg}")
         self.dash_error("region", msg)
-        await self._say(msg, kind="error")
+        await self._say(msg, kind="error", log=True, copied=True)
 
     async def _alert(self, alert):
         cur = self.store_seen()
@@ -981,7 +989,7 @@ class Monitor:
                 tries = (f" after {self.blocks_in_row} blocked tries over {mins:.0f} min"
                          if self.blocks_in_row > 1 else f" after {mins:.0f} min")
                 await self._say(f"Back to normal{tries}: Hobbiesville is returning product data again, "
-                                f"resuming checks. Got through on: {self.describe(job)}.")
+                                f"resuming checks. Got through on: {self.describe(job)}.", log=True)
         except Blocked as b:
             await self.on_blocked(job, b)
         except asyncio.CancelledError:
@@ -1012,11 +1020,11 @@ class Monitor:
         now = self.clock()
         if first_block:          # one message when a block starts, then an update every 10 minutes
             self.block_started = self.last_block_note = now
-            await self._say(msg, kind="error")
+            await self._say(msg, kind="error", log=True, copied=True)
         elif now - self.last_block_note >= BLOCK_UPDATE_SECONDS:
             self.last_block_note = now
             await self._say(f"Still blocked by Hobbiesville: {(now - self.block_started) / 60:.0f} min so far, "
-                            f"{self.blocks_in_row} tries in a row. Next retry in {wait}.", kind="error")
+                            f"{self.blocks_in_row} tries in a row. Next retry in {wait}.", kind="error", log=True)
         self.backoff = min(self.backoff * 2, BACKOFF_MAX)
 
     async def reset_session(self):
@@ -1114,7 +1122,7 @@ class Monitor:
             elif coll not in self._noted:
                 self._noted.add(coll)
                 await self._say(f"The '{coll}' collection has more than {SCAN_PAGES * PAGE_SIZE} products. "
-                                f"I only scan the first {SCAN_PAGES * PAGE_SIZE} (raise SCAN_PAGES to scan more).")
+                                f"I only scan the first {SCAN_PAGES * PAGE_SIZE} (raise SCAN_PAGES to scan more).", log=True)
         else:
             self.scan_counts[coll] = (page - 1) * PAGE_SIZE + len(val)
 
@@ -1541,7 +1549,7 @@ def run_bot():
                     f"Collection scan: {', '.join(self.mon.collections) or 'off'}.\n"
                     f"Alerts when a watched or scanned product comes into stock, or a new one is listed. "
                     f"Every request to Hobbiesville is "
-                    f"{GAP_MIN}-{GAP_MAX}s apart. Type `!help` for commands.")
+                    f"{GAP_MIN}-{GAP_MAX}s apart. Type `!help` for commands.", log=True)
                 jobs = [self.mon.run(), self.mon.run_sync()]
                 if self.shipper:
                     jobs.append(self.shipper.run())

@@ -278,6 +278,29 @@ class TestMonitor(unittest.TestCase):
         self.assertEqual(len(alerts), 1)      # the retried check alerted, and the block itself never did
         self.assertGreaterEqual(clock() - 1000, 300)
 
+    def test_status_messages_go_to_error_channel_not_main(self):
+        blocked = FakeSession([(429, "Too Many Requests", None)])
+        fresh = FakeSession([(200, js_product(True), None)])
+        errors = []
+
+        async def send_error(t):
+            errors.append(t)
+        mon, alerts, texts, _ = make_monitor(blocked, session_factory=lambda: fresh, send_error=send_error)
+        mon.watch = [HANDLE]
+
+        async def go():
+            for _ in range(200):
+                await mon.tick()
+                await asyncio.sleep(0)
+                if mon.requests_made >= 2 and not mon.was_blocked:
+                    break
+            await asyncio.sleep(0)
+        run(go())
+        self.assertEqual(texts, [])                                  # main channel: nothing but the alert
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(sum("refused my request" in e for e in errors), 1)   # block posted once, not twice
+        self.assertEqual(sum("Back to normal" in e for e in errors), 1)
+
     def test_spacing_between_requests(self):
         s = FakeSession([(200, js_product(False), None)])
         mon, _, _, clock = make_monitor(s)
@@ -484,13 +507,16 @@ class TestCollectionScan(unittest.TestCase):
                 await mon.tick()
             await asyncio.sleep(0)
         run(go())
-        self.assertIn("showing me its USD store", texts[-1])
-        self.assertEqual(sum("USD store" in t for t in texts), 1)     # said once, not every check
+        self.assertEqual(texts, [])                                    # not in the main channel
+        self.assertEqual(sum("showing me its USD store" in t for t in errors), 1)   # said once, not every check
         self.assertIn("may be different on the CA store", alerts[0]["why"])
         self.assertIn("WRONG", mon.command("!status"))
         s.currency = "CAD"
-        run(mon.check_region())
-        self.assertIn("CA store again", texts[-1])
+        async def back():
+            await mon.check_region()
+            await asyncio.sleep(0)
+        run(back())
+        self.assertIn("CA store again", errors[-1])
         self.assertNotIn("WRONG", mon.command("!status"))
 
     def test_skip_singles_graded_toys_but_keep_sealed(self):
